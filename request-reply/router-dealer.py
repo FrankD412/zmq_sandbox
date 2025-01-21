@@ -1,3 +1,4 @@
+import random
 from uuid import UUID, uuid4
 import click
 import msgspec
@@ -46,7 +47,7 @@ def proxy_process(frontend_address, backend_address):
 def requester(backend_address, requester_id, stop, num_requests, interval=1):
     print(f"Push Worker {requester_id} started.")
     context = zmq.Context.instance()
-    socket = context.socket(zmq.REQ)
+    socket = context.socket(zmq.DEALER)
     socket.connect(backend_address)
     print(f"Requester {requester_id} connected to {backend_address}")
 
@@ -60,18 +61,22 @@ def requester(backend_address, requester_id, stop, num_requests, interval=1):
                 request_id=uuid4(),
                 timestamp=datetime.now().isoformat(),
             )
-            socket.send(msgspec.json.encode(request))
-            print(f"Requester {requester_id} sent: {request}")
-
-            message = socket.recv()
-            response = decoder.decode(message)
-            print(f"Requester {requester_id} received: {response}")
-            request_counter += 1
+            content = msgspec.json.encode(request)
+            socket.send_multipart([request.request_id.bytes, b"", content])
+            print(f"Requester {requester_id} Address: {request.request_id.bytes} sent: {request}")
+            final = False
+            while not final:
+                message = socket.recv_multipart()
+                response = decoder.decode(message[2])
+                print(f"Requester {requester_id} received: {response}")
+                final = response.final
             request_counter += 1
 
             if num_requests and request_counter >= num_requests:
                 break
             time.sleep(interval)
+    except Exception as e:
+        print(e)
     finally:
         stop.set()
         print(f"Requester {requester_id} stopping.")
@@ -100,25 +105,28 @@ def replier(frontend_address, stop, num_requests, id, multipart):
             print("Replier waiting for message...\n")
             message = socket.recv_multipart()
             print(f"Replier received: {message}")
-            client = message[0]
-            contents = decoder.decode(message[2])
-            socket.send_multipart(
-                [
-                    client,
-                    b"",
-                    encoder.encode(
-                        Response(
-                            requester_id=contents.requester_id,
-                            replier_id=id,
-                            request_id=contents.request_id,
-                            response_id=uuid4(),
-                            timestamp=datetime.now().isoformat(),
-                            part=1,
-                            final=True,
-                        )
-                    ),
-                ]
-            )
+            parts = random.randint(1, multipart)
+            for part in range(parts):
+                client = message[0]
+                contents = decoder.decode(message[3])
+                socket.send_multipart(
+                    [
+                        client,
+                        message[1],
+                        b"",
+                        encoder.encode(
+                            Response(
+                                requester_id=contents.requester_id,
+                                replier_id=id,
+                                request_id=contents.request_id,
+                                response_id=uuid4(),
+                                timestamp=datetime.now().isoformat(),
+                                part=part,
+                                final=bool(part == parts - 1),
+                            )
+                        ),
+                    ]
+                )
             request_counter += 1
     except Exception as e:
         print(e)
@@ -191,6 +199,7 @@ def main(requesters, repliers, backend_port, frontend_port, num_requests, multip
     except KeyboardInterrupt:
         stop_signal.set()
     finally:
+        futures[0]
         executor.shutdown()
         print("Shutting down...")
 
